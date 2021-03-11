@@ -1,0 +1,46 @@
+<html>
+  <body>
+    Olloy!
+  </body>
+  <script type="text/javascript">
+    console.log('ermin');
+
+    function what() {
+      let done = false;
+      return {
+        [Symbol.asyncIterator]() {
+          return this;
+        },
+        async next() {
+          await new Promise((resolve) => {
+            window.next = resolve;
+          });
+          if (done) return { done: true, value: 'pingr' };
+          return {
+            done: false,
+            value: 'ping',
+          };
+        },
+        return() {
+          done = true;
+          return {
+            done: true,
+          };
+        },
+      };
+    }
+
+    (async () => {
+      const f = what();
+      setTimeout(async () => {
+        for await (const val of f) {
+          console.log({ aft: 'ter', val });
+        }
+      }, 2000);
+      for await (const val of f) {
+        console.log({ val });
+      }
+      console.log('complete');
+    })();
+  </script>
+</html>

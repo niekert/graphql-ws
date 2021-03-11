@@ -830,6 +830,32 @@ describe('reconnecting', () => {
     EventEmitter.defaultMaxListeners = defaultMaxListeners; // reset
   });
 
+  it.only('should whatever', async () => {
+    const { url, ...server } = await startTServer();
+
+    const client = createClient({
+      url,
+      retryAttempts: 1,
+      retryWait: () => Promise.resolve(),
+    });
+
+    for (let i = 0; i < 20; i++) {
+      client.subscribe(
+        {
+          query: `subscription Sub${i} { ping(key: "${i}") }`,
+        },
+        {
+          next: noop,
+          error: noop,
+          complete: noop,
+        },
+      );
+      await server.waitForOperation();
+    }
+
+    client.dispose();
+  });
+
   it('should resubscribe all subscribers on silent reconnect when using retry wait delay', async () => {
     const defaultMaxListeners = EventEmitter.defaultMaxListeners;
     EventEmitter.defaultMaxListeners = 50; // for test

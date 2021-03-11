@@ -171,6 +171,12 @@ export interface Client extends Disposable {
   subscribe<T = unknown>(payload: SubscribePayload, sink: Sink<T>): () => void;
 }
 
+interface Connection {
+  socket: WebSocket;
+  next: () => AsyncIterableIterator<Message>;
+  release: () => void;
+}
+
 /** Creates a disposable GraphQL over WebSocket client. */
 export function createClient(options: ClientOptions): Client {
   const {
@@ -268,87 +274,101 @@ export function createClient(options: ClientOptions): Client {
     };
   })();
 
-  let connecting: Promise<[socket: WebSocket, wait: Promise<void>]> | undefined,
+  let connecting: Promise<Omit<Connection, 'release'>> | undefined,
     locks = 0,
     retrying = false,
     retries = 0,
     disposed = false;
-  async function connect(): Promise<
-    [
-      socket: WebSocket,
-      release: () => void,
-      waitForReleaseOrThrowOnClose: Promise<void>,
-    ]
-  > {
+  async function connect(): Promise<Connection> {
     locks++;
 
-    const [socket, waitForCompleteOrThrowOnClose] = await (connecting ??
-      (connecting = new Promise<[WebSocket, Promise<void>]>(
-        (connected, denied) =>
-          (async () => {
-            if (retrying) {
-              await retryWait(retries);
-              retries++;
+    const { socket, next } = await (connecting ??
+      (connecting = new Promise<Connection>((connected, denied) =>
+        (async () => {
+          if (retrying) {
+            await retryWait(retries);
+            retries++;
+          }
+
+          emitter.emit('connecting');
+          const socket = new WebSocketImpl(url, GRAPHQL_TRANSPORT_WS_PROTOCOL);
+
+          let next: (
+            done: boolean,
+            closed?: LikeCloseEvent,
+            message?: Message,
+          ) => void;
+
+          socket.onclose = (event) => {
+            next?.(true, event); // if next is not yet registered, the close denied the connect
+            connecting = undefined;
+            emitter.emit('closed', event);
+            denied(event);
+          };
+
+          socket.onopen = async () => {
+            try {
+              socket.send(
+                stringifyMessage<MessageType.ConnectionInit>({
+                  type: MessageType.ConnectionInit,
+                  payload:
+                    typeof connectionParams === 'function'
+                      ? await connectionParams()
+                      : connectionParams,
+                }),
+              );
+            } catch (err) {
+              socket.close(
+                4400,
+                err instanceof Error ? err.message : new Error(err).message,
+              );
             }
+          };
 
-            emitter.emit('connecting');
-            const socket = new WebSocketImpl(
-              url,
-              GRAPHQL_TRANSPORT_WS_PROTOCOL,
-            );
-
-            socket.onclose = (event) => {
-              connecting = undefined;
-              emitter.emit('closed', event);
-              denied(event);
-            };
-
-            socket.onopen = async () => {
-              try {
-                socket.send(
-                  stringifyMessage<MessageType.ConnectionInit>({
-                    type: MessageType.ConnectionInit,
-                    payload:
-                      typeof connectionParams === 'function'
-                        ? await connectionParams()
-                        : connectionParams,
-                  }),
-                );
-              } catch (err) {
-                socket.close(
-                  4400,
-                  err instanceof Error ? err.message : new Error(err).message,
+          socket.onmessage = ({ data }) => {
+            socket.onmessage = null; // interested only in the first message
+            try {
+              const message = parseMessage(data);
+              if (message.type !== MessageType.ConnectionAck) {
+                throw new Error(
+                  `First message cannot be of type ${message.type}`,
                 );
               }
-            };
+              emitter.emit('connected', socket, message.payload); // connected = socket opened + acknowledged
+              retries = 0; // reset the retries on connect
 
-            socket.onmessage = ({ data }) => {
-              socket.onmessage = null; // interested only in the first message
-              try {
-                const message = parseMessage(data);
-                if (message.type !== MessageType.ConnectionAck) {
-                  throw new Error(
-                    `First message cannot be of type ${message.type}`,
-                  );
-                }
-                emitter.emit('connected', socket, message.payload); // connected = socket opened + acknowledged
-                retries = 0; // reset the retries on connect
-                connected([
-                  socket,
-                  new Promise<void>((complete, error) =>
-                    socket.addEventListener('close', (event) =>
-                      event.code === 1000 ? complete() : error(event),
-                    ),
-                  ),
-                ]);
-              } catch (err) {
-                socket.close(
-                  4400,
-                  err instanceof Error ? err.message : new Error(err).message,
-                );
-              }
-            };
-          })(),
+              // create a message async iterator that also serves as a connection listener
+              connected({
+                socket,
+                next() {
+                  let done = false;
+
+                  return {
+                    [Symbol.asyncIterator]() {
+                      return this;
+                    },
+                    async next() {
+                      if (closed) throw closed;
+                      if (done) return { done, value: undefined };
+                      return {
+                        done,
+                        value: null as any,
+                      };
+                    },
+                  };
+                },
+                release() {
+                  next!(true);
+                },
+              });
+            } catch (err) {
+              socket.close(
+                4400,
+                err instanceof Error ? err.message : new Error(err).message,
+              );
+            }
+          };
+        })(),
       )));
 
     let release = () => {
@@ -427,8 +447,10 @@ export function createClient(options: ClientOptions): Client {
     (async () => {
       for (;;) {
         try {
-          const [, , waitForReleaseOrThrowOnClose] = await connect();
-          await waitForReleaseOrThrowOnClose;
+          const { next } = await connect();
+          for await (const _ of next()) {
+            /** we dont care about the messages, the loop will break on complete */
+          }
           return; // completed, shouldnt try again
         } catch (errOrCloseEvent) {
           try {
@@ -467,49 +489,13 @@ export function createClient(options: ClientOptions): Client {
         },
       };
 
-      function messageHandler({ data }: MessageEvent) {
-        const message = memoParseMessage(data);
-        switch (message.type) {
-          case MessageType.Next: {
-            if (message.id === id) {
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              sink.next(message.payload as any);
-            }
-            return;
-          }
-          case MessageType.Error: {
-            if (message.id === id) {
-              completed = true;
-              sink.error(message.payload);
-              releaserRef.current();
-              // TODO-db-201025 calling releaser will complete the sink, meaning that both the `error` and `complete` will be
-              // called. neither promises or observables care; once they settle, additional calls to the resolvers will be ignored
-            }
-            return;
-          }
-          case MessageType.Complete: {
-            if (message.id === id) {
-              completed = true;
-              releaserRef.current(); // release completes the sink
-            }
-            return;
-          }
-        }
-      }
-
       (async () => {
         for (;;) {
           try {
-            const [
-              socket,
-              release,
-              waitForReleaseOrThrowOnClose,
-            ] = await connect();
+            const { socket, next, release } = await connect();
 
             // if completed while waiting for connect, release the connection lock right away
             if (completed) return release();
-
-            socket.addEventListener('message', messageHandler);
 
             socket.send(
               stringifyMessage<MessageType.Subscribe>({
@@ -533,11 +519,35 @@ export function createClient(options: ClientOptions): Client {
             };
 
             // either the releaser will be called, connection completed and
-            // the promise resolved or the socket closed and the promise rejected
-            await waitForReleaseOrThrowOnClose;
-
-            socket.removeEventListener('message', messageHandler);
-
+            // the iterator returns or the socket closed and the iterator throws
+            for await (const message of next()) {
+              switch (message.type) {
+                case MessageType.Next: {
+                  if (message.id === id) {
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    sink.next(message.payload as any);
+                  }
+                  break;
+                }
+                case MessageType.Error: {
+                  if (message.id === id) {
+                    completed = true;
+                    sink.error(message.payload);
+                    releaserRef.current();
+                    // TODO-db-201025 calling releaser will complete the sink, meaning that both the `error` and `complete` will be
+                    // called. neither promises or observables care; once they settle, additional calls to the resolvers will be ignored
+                  }
+                  break;
+                }
+                case MessageType.Complete: {
+                  if (message.id === id) {
+                    completed = true;
+                    releaserRef.current(); // release completes the sink
+                  }
+                  break;
+                }
+              }
+            }
             return; // completed, shouldnt try again
           } catch (errOrCloseEvent) {
             if (!shouldRetryConnectOrThrow(errOrCloseEvent)) return;
@@ -553,7 +563,7 @@ export function createClient(options: ClientOptions): Client {
       disposed = true;
       if (connecting) {
         // if there is a connection, close it
-        const [socket] = await connecting;
+        const { socket } = await connecting;
         socket.close(1000, 'Normal Closure');
       }
       emitter.reset();
